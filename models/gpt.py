@@ -16,7 +16,7 @@ from openai import OpenAI
 MODEL_NAME     = "gpt-5"
 TEMPERATURE    = 1            # gpt-5는 temperature=1만 지원
 TEMPERATURE_SC = 1            # gpt-5는 temperature=1만 지원
-MAX_COMPLETION_TOKENS = 2048
+MAX_COMPLETION_TOKENS = 8192
 MAX_RETRIES    = 3
 RETRY_DELAY    = 5
 
@@ -47,7 +47,15 @@ def call(prompt: str, temperature: float = TEMPERATURE) -> str:
                 temperature=temperature,
                 max_completion_tokens=MAX_COMPLETION_TOKENS
             )
-            return response.choices[0].message.content.strip()
+            choice = response.choices[0]
+            content = choice.message.content or ""
+            if not content.strip():
+                finish = choice.finish_reason
+                usage = response.usage
+                print(f"    [GPT] Empty response — finish_reason={finish}, "
+                      f"prompt_tokens={usage.prompt_tokens if usage else '?'}, "
+                      f"completion_tokens={usage.completion_tokens if usage else '?'}")
+            return content.strip()
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
                 print(f"    [GPT] 오류 (시도 {attempt+1}/{MAX_RETRIES}): {e}")

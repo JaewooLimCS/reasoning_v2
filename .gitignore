@@ -5,3 +5,6 @@ __pycache__/
 collected/*.json
 collected/*failed
 data/pool_seed42.json
+.claude/
+.env
+.claude/

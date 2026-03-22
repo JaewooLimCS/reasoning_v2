@@ -19,6 +19,10 @@ Changes from original code (to match paper more faithfully):
   2. GSM8K feedback prompt is neutral (not biased toward assuming errors)
   3. Added few-shot examples for GSM8K from Appendix O (Figures 30-32)
   4. build_prefine() accepts full history list instead of single (solution, feedback) pair
+  5. Few-shot examples wrapped with ## Example / ## End of example markers to prevent
+     cups/plates contamination into current-problem feedback
+  6. GSM8K feedback prompt allows "The solution is correct." response for early stopping
+  7. is_stop() also treats empty feedback as stop signal
 """
 
 from typing import List, Tuple
@@ -109,19 +113,23 @@ def solution():
     \"\"\"{question}\"\"\"
 """
 
-GSM8K_PFB = """{fewshot_fb}
+GSM8K_PFB = """## Example of reviewing code for errors:
 
-###
+{fewshot_fb}
+
+## End of example. Now review the following code:
 
 {solution}
 
-# There is an error in the code above because of lack of understanding of the question. What is the error? To find the error, go through semantically complete blocks of the code, and check if everything looks good.
+# Review the code above. Go through semantically complete blocks of the code, and check if everything correctly implements the question.
+# If the code is correct, respond ONLY with: The solution is correct.
+# If there is an error, explain the error step by step."""
 
-# Let us go through the error and check step-by-step"""
+GSM8K_PREFINE = """## Example of reviewing and rewriting code:
 
-GSM8K_PREFINE = """{fewshot_refine}
+{fewshot_refine}
 
-###
+## End of example. Now rewrite the following code:
 
 Problem: {question}
 
@@ -327,9 +335,12 @@ def build_prefine(benchmark: str, question: str,
 def is_stop(feedback: str) -> bool:
     """Check if feedback indicates the solution is correct (early stopping).
 
-    Used for NL tasks (HotPotQA, BBH) where feedback contains a textual stop signal.
-    For GSM8K, use is_stop_gsm8k() with exec()-based answer checking instead.
+    Returns True if:
+      - feedback contains "The solution is correct." (text-based stop signal)
+      - feedback is empty/whitespace (model had nothing to criticize)
     """
+    if not feedback.strip():
+        return True
     return STOP_SIGNAL.lower() in feedback.lower()
 
 

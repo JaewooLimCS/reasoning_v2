@@ -60,6 +60,118 @@ BBH_TASK_DESCRIPTIONS = {
 
 # ── 정답 추출 및 판별 ─────────────────────────────────────────────────────────
 
+def extract_number_from_json(text: str):
+    """Extract numeric answer from JSON-structured response (Self-Discover).
+
+    Strategy: two-pass search.
+      Pass 1 — find keys whose name contains 'final' (final_answer, final_numeric_answer,
+               conclusion_final_answer, etc.) and extract a number from their subtree.
+      Pass 2 — fall back to 'answer', 'result', 'value' at the deepest level.
+    This avoids grabbing step numbers or intermediate 'value' fields."""
+    try:
+        obj = json.loads(text.strip())
+    except (json.JSONDecodeError, ValueError):
+        m = re.search(r'\{[\s\S]+\}', text)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group())
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def _to_number(node):
+        """Try to coerce a scalar node to a number."""
+        if isinstance(node, bool):
+            return None
+        if isinstance(node, (int, float)):
+            return int(node) if float(node) == int(float(node)) else node
+        if isinstance(node, str):
+            cleaned = node.strip().replace(',', '').lstrip('$')
+            try:
+                f = float(cleaned)
+                return int(f) if f == int(f) else f
+            except ValueError:
+                return None
+        return None
+
+    def _extract_from_subtree(node, depth=0):
+        """Extract a number from a subtree: check 'value' key first, then scalars."""
+        if depth > 5:
+            return None
+        n = _to_number(node)
+        if n is not None:
+            return n
+        if isinstance(node, dict):
+            # Prefer 'value' key inside this subtree
+            if 'value' in node:
+                n = _to_number(node['value'])
+                if n is not None:
+                    return n
+            # Try other scalar values
+            for v in node.values():
+                n = _to_number(v)
+                if n is not None:
+                    return n
+            # Recurse one more level
+            for v in node.values():
+                if isinstance(v, dict):
+                    n = _extract_from_subtree(v, depth + 1)
+                    if n is not None:
+                        return n
+        return None
+
+    # Pass 1: find keys containing 'final' — these are the conclusion fields
+    final_keys_pattern = re.compile(r'final', re.IGNORECASE)
+    candidates = []  # (depth, key_path, node)
+
+    def _collect_final_keys(node, depth=0, path=""):
+        if depth > 15:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                p = f"{path}.{k}"
+                if final_keys_pattern.search(k):
+                    candidates.append((depth, p, v))
+                _collect_final_keys(v, depth + 1, p)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                _collect_final_keys(v, depth + 1, f"{path}[{i}]")
+
+    _collect_final_keys(obj)
+
+    # Sort by depth descending — deepest 'final' key is most likely the actual answer
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    for _, path, node in candidates:
+        n = _extract_from_subtree(node)
+        if n is not None:
+            return n
+
+    # Pass 2: fallback — look for 'answer'/'result' keys at any level (deepest first)
+    fallback_keys = re.compile(r'^(answer|result)$', re.IGNORECASE)
+    fallbacks = []
+
+    def _collect_fallbacks(node, depth=0):
+        if depth > 15:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if fallback_keys.match(k):
+                    fallbacks.append((depth, v))
+                _collect_fallbacks(v, depth + 1)
+        elif isinstance(node, list):
+            for v in node:
+                _collect_fallbacks(v, depth + 1)
+
+    _collect_fallbacks(obj)
+    fallbacks.sort(key=lambda x: x[0], reverse=True)
+    for _, node in fallbacks:
+        n = _extract_from_subtree(node)
+        if n is not None:
+            return n
+
+    return None
+
+
 def extract_number(text: str):
     text = text.strip()
     for pat in [
@@ -88,8 +200,44 @@ def extract_number(text: str):
     return None
 
 
-def extract_answer_generic(text: str) -> str:
+def _extract_pred(text: str, benchmark: str):
+    """Dispatch to the right extractor based on benchmark."""
+    if benchmark == "gsm8k":
+        return extract_number(text)
+    return extract_answer_generic(text, bbh_options=(benchmark == "bbh"))
+
+
+def extract_bbh_option(text: str):
+    """Extract BBH multiple-choice option label (A)~(F) from text.
+    Returns the option string like '(A)' or None if not found."""
+    # Priority 1: "the answer is (X)" pattern
+    m = re.search(r'[Tt]he answer is[:\s]*\(?([A-F])\)?', text)
+    if m:
+        return f"({m.group(1)})"
+    # Priority 2: "Answer: (X)" or "answer: X"
+    m = re.search(r'[Aa]nswer[:\s]*\(?([A-F])\)?', text)
+    if m:
+        return f"({m.group(1)})"
+    # Priority 3: option label at start of text or after newline
+    m = re.search(r'(?:^|\n)\s*\(?([A-F])\)?[\s\.\)]', text)
+    if m:
+        return f"({m.group(1)})"
+    # Priority 4: any standalone (X) pattern
+    m = re.search(r'\(([A-F])\)', text)
+    if m:
+        return f"({m.group(1)})"
+    return None
+
+
+def extract_answer_generic(text: str, bbh_options: bool = False) -> str:
     text = text.strip()
+
+    # BBH option extraction — try first if requested
+    if bbh_options:
+        opt = extract_bbh_option(text)
+        if opt:
+            return opt
+
     for pat in [
         r"[Tt]he answer is[:\s]+(.+?)(?:\n|$)",
         r"[Ff]inal [Aa]nswer[:\s]+(.+?)(?:\n|$)",
@@ -168,7 +316,7 @@ def run_standard_io(problem, model_fn, benchmark):
     t0 = time.time()
     response = model_fn(prompt)
     elapsed = round(time.time() - t0, 2)
-    pred = extract_number(response) if benchmark == "gsm8k" else extract_answer_generic(response)
+    pred = _extract_pred(response, benchmark)
     return {"method": "standard_io", "prompt": prompt, "response": response,
             "predicted_answer": pred, "elapsed_seconds": elapsed}
 
@@ -185,7 +333,7 @@ def run_zero_shot_cot(problem, model_fn, benchmark):
     if benchmark == "gsm8k":
         pred = extract_number(answer_text) or extract_number(reasoning)
     else:
-        pred = extract_answer_generic(answer_text)
+        pred = extract_answer_generic(answer_text, bbh_options=(benchmark == "bbh"))
     return {"method": "zero_shot_cot", "prompt_step1": p1, "reasoning": reasoning,
             "prompt_step2": p2, "answer_text": answer_text,
             "predicted_answer": pred, "elapsed_seconds": elapsed}
@@ -215,7 +363,7 @@ def run_least_to_most(problem, model_fn, benchmark):
     # Final answer from last solving step
     final_response = solved[-1][1] if solved else ""
     elapsed = round(time.time() - t0, 2)
-    pred = extract_number(final_response) if benchmark == "gsm8k" else extract_answer_generic(final_response)
+    pred = _extract_pred(final_response, benchmark)
 
     return {"method": "least_to_most",
             "decompose_prompt": decompose_prompt,
@@ -237,7 +385,7 @@ def run_cot_sc(problem, model_fn_n, benchmark):
     elapsed = round(time.time() - t0, 2)
     paths, answers = [], []
     for i, raw in enumerate(paths_raw):
-        ans = extract_number(raw) if benchmark == "gsm8k" else extract_answer_generic(raw)
+        ans = _extract_pred(raw, benchmark)
         paths.append({"path_id": i+1, "reasoning": raw, "extracted_answer": ans})
         if ans is not None:
             answers.append(str(ans))
@@ -265,8 +413,14 @@ def run_self_refine(problem, model_fn, benchmark):
 
     iterations = []
     history = []  # ✅ 추가: Equation 4 히스토리 누적
+    gold = problem.get("answer")  # GSM8K oracle stopping용
 
     for i in range(p_selfrefine.MAX_ITERATIONS):
+        # GSM8K oracle stopping (Appendix O): exec하여 정답이면 중단
+        if benchmark == "gsm8k" and gold is not None:
+            if p_selfrefine.is_stop_gsm8k(solution, float(gold)):
+                break
+
         # Step 2: Feedback (Equation 2)
         pfb = p_selfrefine.build_pfb(benchmark, q, solution, td, context=context)
         feedback = model_fn(pfb)
@@ -292,7 +446,7 @@ def run_self_refine(problem, model_fn, benchmark):
     if benchmark == "gsm8k":
         pred = _exec_code_answer(solution) or extract_number(solution)
     else:
-        pred = extract_answer_generic(solution)
+        pred = extract_answer_generic(solution, bbh_options=(benchmark == "bbh"))
 
     return {"method": "self_refine", "initial_pgen": pgen, "iterations": iterations,
             "final_solution": solution, "predicted_answer": pred,
@@ -305,15 +459,38 @@ def run_self_discover(problem, model_fn, benchmark):
     td = p_selfdiscover.get_task_description(benchmark, subtask)
     q = problem["question"]
     t0 = time.time()
-    selected  = model_fn(p_selfdiscover.build_select_prompt(td))
-    adapted   = model_fn(p_selfdiscover.build_adapt_prompt(td, selected))
-    structure = model_fn(p_selfdiscover.build_implement_prompt(td, adapted))
+    # Stage 1: SELECT → resolve module numbers to full descriptions
+    selected_raw = model_fn(p_selfdiscover.build_select_prompt(td))
+    selected = p_selfdiscover.resolve_selected_modules(selected_raw)
+
+    # Stage 1: ADAPT — detect failure (returned selected verbatim) and retry
+    adapt_prompt = p_selfdiscover.build_adapt_prompt(td, selected)
+    adapted = model_fn(adapt_prompt)
+    if not adapted.strip() or adapted.strip() == selected.strip() or len(adapted.strip()) < len(selected.strip()) * 1.3:
+        print(f"      [self_discover] ADAPT retry — output too similar to selected ({len(adapted)} vs {len(selected)} chars)")
+        adapted = model_fn(adapt_prompt)
+    if not adapted.strip():
+        adapted = selected
+
+    # Stage 1: IMPLEMENT — retry up to 3 times if empty
+    structure = ""
+    impl_prompt = p_selfdiscover.build_implement_prompt(td, adapted)
+    for impl_attempt in range(3):
+        structure = model_fn(impl_prompt)
+        if structure.strip():
+            break
+        print(f"      [self_discover] IMPLEMENT retry {impl_attempt + 1}/3 — empty response")
     apply_prompt = p_selfdiscover.build_apply_prompt(td, structure, q, context=context)
     response  = model_fn(apply_prompt)
     elapsed = round(time.time() - t0, 2)
-    pred = extract_number(response) if benchmark == "gsm8k" else extract_answer_generic(response)
+    if benchmark in ("gsm8k", "bbh"):
+        # Priority: JSON keys → "the answer is" pattern → last number
+        pred = extract_number_from_json(response) or extract_number(response)
+    else:
+        pred = extract_answer_generic(response, bbh_options=(benchmark == "bbh"))
     return {"method": "self_discover", "task_description": td,
-            "stage1": {"selected_modules": selected, "adapted_modules": adapted,
+            "stage1": {"selected_modules_raw": selected_raw,
+                       "selected_modules": selected, "adapted_modules": adapted,
                        "reasoning_structure": structure},
             "apply_prompt": apply_prompt, "response": response,
             "predicted_answer": pred, "elapsed_seconds": elapsed}

@@ -14,6 +14,8 @@ Meta-prompts: Paper Figure 10 (Appendix A, exact)
 39 Reasoning Modules: Paper Table 2 (Appendix A, exact)
 """
 
+import re as _re
+
 # ============================================================
 # 39 REASONING MODULES — Paper Table 2 (exact)
 # ============================================================
@@ -100,29 +102,12 @@ Adapt each reasoning module description to better solve the tasks:"""
 # ============================================================
 IMPLEMENT_PROMPT = """Operationalize the reasoning modules into a step-by-step reasoning plan in JSON format:
 
-Here's an example:
-Example task: If you follow these instructions, do you return to the starting point? Always face forward. Take 1 step backward. Take 9 steps left. Take 2 steps backward. Take 6 steps forward.
-Example reasoning structure:
-{{
-    "Position Tracking": {{
-        "Step 1": "Track your starting position",
-        "Step 2": "After each instruction, update your position"
-    }},
-    "Net Displacement": {{
-        "Step 3": "Calculate net forward/backward movement",
-        "Step 4": "Calculate net left/right movement"
-    }},
-    "Return Check": {{
-        "Step 5": "Check if net displacement in all directions is zero"
-    }}
-}}
-
 Adapted module descriptions:
 {adapted_modules}
 
 Task: {task_description}
 
-Implement a reasoning structure for solvers to follow step-by-step and arrive at correct answers:"""
+Implement a reasoning structure (in JSON) for solvers to follow step-by-step and arrive at correct answers:"""
 
 # ============================================================
 # STAGE 2: APPLY (Solve) — Paper Figure 10 
@@ -137,6 +122,63 @@ Task: {task_description}
 {context_block}Question: {question}
 
 Thus, the final answer is"""
+
+
+# ============================================================
+# Module lookup: parse REASONING_MODULES into {number: full_text}
+# ============================================================
+
+_MODULE_LOOKUP: dict = {}
+
+def _build_module_lookup():
+    """Parse REASONING_MODULES into {int: str} mapping once."""
+    if _MODULE_LOOKUP:
+        return
+    lines = REASONING_MODULES.strip().splitlines()
+    current_num = None
+    current_text = []
+    for line in lines:
+        m = _re.match(r'^(\d{1,2})\s+', line)
+        if m:
+            if current_num is not None:
+                _MODULE_LOOKUP[current_num] = ' '.join(current_text).strip()
+            current_num = int(m.group(1))
+            current_text = [line]
+        elif current_num is not None:
+            current_text.append(line)
+    if current_num is not None:
+        _MODULE_LOOKUP[current_num] = ' '.join(current_text).strip()
+
+_build_module_lookup()
+
+
+def resolve_selected_modules(selected_raw: str) -> str:
+    """Normalize SELECT output: if only numbers, expand to full descriptions.
+
+    SELECT sometimes returns just "4, 9, 10, 16, 38, 39" without descriptions.
+    This function detects that and looks up the full module text, ensuring
+    ADAPT always receives complete descriptions.
+    """
+    stripped = selected_raw.strip()
+    if not stripped:
+        return stripped
+
+    # Heuristic: if the response is short and looks like just numbers/commas,
+    # expand them. If it already contains descriptions (long text), pass through.
+    nums = _re.findall(r'\b(\d{1,2})\b', stripped)
+    non_digit_chars = _re.sub(r'[\d,\s\-\.]', '', stripped)
+
+    # If almost all content is numbers/punctuation → needs expansion
+    if nums and len(non_digit_chars) < 30:
+        expanded = []
+        for n in nums:
+            n_int = int(n)
+            if n_int in _MODULE_LOOKUP:
+                expanded.append(f"- {_MODULE_LOOKUP[n_int]}")
+        if expanded:
+            return '\n'.join(expanded)
+
+    return stripped
 
 
 def build_select_prompt(task_description: str) -> str:
@@ -160,8 +202,25 @@ def build_implement_prompt(task_description: str, adapted_modules: str) -> str:
     )
 
 
+DEFAULT_STRUCTURE = """{
+    "Understand": {
+        "Step 1": "Identify the key information and what the question asks for",
+        "Step 2": "List the given values and relationships"
+    },
+    "Solve": {
+        "Step 3": "Break the problem into sub-steps",
+        "Step 4": "Solve each sub-step showing your work"
+    },
+    "Verify": {
+        "Step 5": "Check the answer for correctness and state the final answer"
+    }
+}"""
+
+
 def build_apply_prompt(task_description: str, reasoning_structure: str,
                        question: str, context: str = "") -> str:
+    if not reasoning_structure.strip():
+        reasoning_structure = DEFAULT_STRUCTURE
     context_block = f"Context:\n{context}\n\n" if context else ""
     return APPLY_PROMPT.format(
         reasoning_structure=reasoning_structure,
